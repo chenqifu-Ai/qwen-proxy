@@ -1,0 +1,19 @@
+# 日志文件
+logs/
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 备份文件  
+*.bak
+*.backup
+
+# Docker相关
+.DS_Store
+Thumbs.db
+
+# 本地配置覆盖
+local.conf
+override.yml
