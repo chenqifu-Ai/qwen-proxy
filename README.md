@@ -1,145 +1,110 @@
-# 🚀 Qwen3.6-35B 流式代理配置
+# qwen-proxy
 
-## 📋 概述
+纯 Python 实现的 OpenAI 兼容 API 代理，零依赖（仅用标准库）。
 
-专为 Qwen3.6-35B API 设计的**高性能流式代理**，支持：
-- ✅ 流式传输 (SSE)
-- ✅ 负载均衡
-- ✅ 长连接保持
-- ✅ 自动重连
-- ✅ 健康监控
-
-## 🎯 配置详情
-
-### 网络架构
 ```
-客户端 → Nginx (8765) → Qwen3.6-35B (58.23.129.98:8000)
+客户端 → proxy.py:8765 → Qwen3.6-35B (58.23.129.98:8001)
 ```
 
-### 核心特性
-- **端口**: 8765
-- **目标**: 58.23.129.98:8000  
-- **API密钥**: sk-78sadn09bjawde123e
-- **超时**: 300秒
-- **流式**: 完全支持
+## 亮点
 
-## 🚀 快速开始
+- **零依赖** — 只有 Python 3 标准库，`http.server` + `http.client`
+- **流式 SSE** — 完整转发 `stream=true` 的 chunked 响应
+- **抓包级日志** — 每个请求/响应打印原始字节、Hex 转储、文本内容（像 Wireshark）
+- **GET 转发** — `/v1/models` 等端点到上游
 
-### 方法一：Docker部署（推荐）
+## 快速开始
+
 ```bash
-cd /root/downloads/proxy-config
+# 直接运行
+python3 proxy.py
 
-# 启动代理
-chmod +x start.sh
-./start.sh
-
-# 或者直接使用 docker-compose
-docker-compose up -d
+# 后台运行
+nohup python3 proxy.py > /tmp/proxy.log 2>&1 &
 ```
 
-### 方法二：系统Nginx部署
+默认监听 `0.0.0.0:8765`，转发到 `58.23.129.98:8001`。
+
+## API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat/completions` | POST | 聊天补全（支持 `stream: true`） |
+| `/v1/models` | GET | 列出可用模型 |
+| `/health` | GET | 健康检查 |
+
+### 使用示例
+
 ```bash
-# 复制配置
-sudo cp nginx.conf /etc/nginx/nginx.conf
+# 非流式
+curl -X POST http://localhost:8765/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-35b","messages":[{"role":"user","content":"你好"}],"max_tokens":100}'
 
-# 重启Nginx
-sudo systemctl restart nginx
-```
+# 流式
+curl -N -X POST http://localhost:8765/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-35b","messages":[{"role":"user","content":"你好"}],"max_tokens":100,"stream":true}'
 
-## 📊 监控管理
+# 模型列表
+curl http://localhost:8765/v1/models
 
-### 健康检查
-```bash
+# 健康检查
 curl http://localhost:8765/health
 ```
 
-### 状态监控
-```bash
-curl http://localhost:8765/nginx_status
+## 日志格式
+
+每条请求/响应打印三部分：
+
+```
+📥 INCOMING (291 bytes)
+  RAW BYTES:  POST /v1/chat/completions HTTP/1.1...
+  HEX DUMP:   0000: 50 4f 53 54 20 2f...POST /v1/chat/co
+  TEXT:       0: POST /v1/chat/completions HTTP/1.1
+              1: Host: localhost:8765
+              ...
+
+📤 OUTGOING (148 bytes)
+  RAW BYTES:  HTTP/1.1 200 OK...
+  HEX DUMP:   0000: 48 54 54 50 2f...HTTP/1.1 200 OK.
+  TEXT:       0: HTTP/1.1 200 OK
+              ...
 ```
 
-### 日志查看
-```bash
-tail -f logs/access.log
-tail -f logs/error.log
+## 配置
+
+编辑 `proxy.py` 顶部常量：
+
+```python
+TARGET_HOST = "58.23.129.98"   # 上游 API 地址
+TARGET_PORT = 8001              # 上游 API 端口
+API_KEY     = "sk-78sadn09bjawde123e"  # 上游 API Key
+LISTEN_PORT = 8765              # 本地监听端口
 ```
 
-## 🎯 API使用示例
+## 文件结构
 
-### 普通请求
-```bash
-curl -X POST http://localhost:8765/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.6-35b",
-    "messages": [{"role": "user", "content": "你好"}],
-    "max_tokens": 100
-  }'
-```
-
-### 流式请求
-```bash
-curl -X POST http://localhost:8765/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Accept: text/event-stream" \
-  -d '{
-    "model": "qwen3.6-35b", 
-    "messages": [{"role": "user", "content": "你好"}],
-    "max_tokens": 100,
-    "stream": true
-  }'
-```
-
-## ⚙️ 配置优化
-
-### 流式传输关键配置
-```nginx
-proxy_buffering off;      # 禁用缓冲
-proxy_request_buffering off;
-keepalive_timeout 300s;   # 长连接超时
-proxy_read_timeout 300s;  # 代理读超时
-```
-
-### 性能优化
-```nginx
-worker_processes auto;     # 自动工作进程
-worker_connections 1024;   # 每个进程连接数
-use epoll;                # 高性能事件模型
-multi_accept on;          # 多连接接受
-```
-
-## 🔧 故障排除
-
-### 常见问题
-1. **流式中断**: 检查 `proxy_buffering` 是否关闭
-2. **连接超时**: 调整 `proxy_read_timeout`
-3. **认证失败**: 确认API密钥正确
-
-### 日志调试
-```bash
-# 查看错误日志
-tail -f logs/error.log
-
-# 查看访问日志  
-tail -f logs/access.log
-```
-
-## 📁 文件结构
 ```
 proxy-config/
-├── nginx.conf          # Nginx主配置
-├── docker-compose.yml   # Docker部署配置
-├── start.sh            # 启动脚本
-├── monitor.py          # 监控脚本
-└── README.md           # 说明文档
+├── proxy.py                  # 核心代理（唯一运行的文件）
+├── docker-compose.yml        # 旧版 Nginx Docker 部署（已弃用）
+├── docker-compose-logging.yml
+├── nginx.conf                # 旧版 Nginx 配置（已弃用）
+├── nginx-logging.conf
+├── start.sh                  # 旧版启动脚本（已弃用）
+├── monitor.py                # 旧版监控（已弃用）
+├── log-analyzer.py           # 旧版日志分析（已弃用）
+├── log-viewer.sh             # 旧版日志查看（已弃用）
+├── logs/                     # 旧版日志目录
+└── README.md
 ```
 
-## 🎯 性能指标
-- ✅ 支持100+并发连接
-- ✅ 300秒长连接保持  
-- ✅ 实时流式传输
-- ✅ 自动故障恢复
+> **注**: `proxy.py` 是唯一实际使用的文件。其余为早期 Nginx/Docker 方案的遗留文件，计划清理。
 
----
-**最后更新**: 2026-04-26
-**版本**: v1.0
+## 上游 API 信息
+
+- 模型: `qwen3.6-35b`
+- 引擎: vLLM
+- 上下文长度: 262144 (256K)
+- 运行位置: `58.23.129.98:8001`
