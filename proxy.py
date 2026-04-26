@@ -30,6 +30,58 @@ def trunc(s, n=200):
     s = str(s)
     return s[:n] + ("..." if len(s) > n else "")
 
+def hexdump(data, offset=0):
+    """生成漂亮的 hex dump，每行 16 字节"""
+    lines = []
+    ascii_buf = ""
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        hex_str = " ".join(f"{b:02x}" for b in chunk)
+        # 右对齐补空格
+        hex_str = hex_str.ljust(47)
+        ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        addr = f"{offset + i:04x}"
+        lines.append(f" {addr}: {hex_str} {ascii_str}")
+    return "\n".join(lines)
+
+def dump_incoming(method, path, headers, body):
+    """记录完整的入站请求（包含原始字节/hex/文本）"""
+    # 重建原始 HTTP 请求
+    req_line = f"{method} {path} HTTP/1.1"
+    header_lines = [f"{k}: {v}" for k, v in headers.items()]
+    raw = (req_line + "\r\n" + "\r\n".join(header_lines) + "\r\n\r\n").encode() + body
+    size = len(raw)
+    print(f"\n{'='*80}", flush=True)
+    print(f" [{ts()}] 📥 INCOMING ({size} bytes) {'='*60}", flush=True)
+    print(f" RAW BYTES:\n {raw[:2000].decode('utf-8', 'replace')}", flush=True)
+    print(f" HEX DUMP:")
+    print(hexdump(raw), flush=True)
+    print(f" TEXT CONTENT:")
+    for i, line in enumerate(raw.decode("utf-8", "replace").split("\r\n")):
+        print(f"  {i}: {line}", flush=True)
+    print(f"{'='*80}", flush=True)
+
+def dump_outgoing(status, reason, headers, body):
+    """记录完整的出站响应（包含原始字节/hex/文本）"""
+    status_line = f"HTTP/1.1 {status} {reason}"
+    # headers 可能是 list of tuples 或 dict
+    if isinstance(headers, dict):
+        header_items = headers.items()
+    else:
+        header_items = headers
+    header_lines = [f"{k}: {v}" for k, v in header_items]
+    raw = (status_line + "\r\n" + "\r\n".join(header_lines) + "\r\n\r\n").encode() + (body or b"")
+    size = len(raw)
+    print(f"{'='*80}", flush=True)
+    print(f" [{ts()}] 📤 OUTGOING ({size} bytes) {'='*60}", flush=True)
+    print(f" RAW BYTES:\n {raw[:2000].decode('utf-8', 'replace')}", flush=True)
+    print(f" HEX DUMP:")
+    print(hexdump(raw), flush=True)
+    print(f" TEXT CONTENT:")
+    for i, line in enumerate(raw.decode("utf-8", "replace").split("\r\n")):
+        print(f"  {i}: {line}", flush=True)
+    print(f"{'='*80}", flush=True)
+
 # ── 代理处理核心 ──
 
 def proxy_normal(path, req_body, req_headers):
@@ -39,11 +91,15 @@ def proxy_normal(path, req_body, req_headers):
         conn.request("POST", path, body=req_body, headers=req_headers)
         resp = conn.getresponse()
         resp_body = resp.read()
-        log("RESP", f"HTTP {resp.status} | body_len={len(resp_body)} | {trunc(resp_body.decode('utf-8','replace'), 150)}")
-        return resp.status, resp.getheaders(), resp_body
+        status = resp.status
+        reason = resp.reason
+        headers = [(k, v) for k, v in resp.getheaders() if k.lower() not in ("transfer-encoding", "content-encoding")]
+        dump_outgoing(status, reason, headers, resp_body)
+        return status, headers, resp_body
     except Exception as e:
-        log("RESP", f"ERROR: {e}")
-        return 502, [("Content-Type", "application/json")], json.dumps({"error": str(e)}).encode()
+        err_body = json.dumps({"error": str(e)}).encode()
+        dump_outgoing(502, "Bad Gateway", [("Content-Type", "application/json")], err_body)
+        return 502, [("Content-Type", "application/json")], err_body
     finally:
         conn.close()
 
@@ -63,12 +119,20 @@ def proxy_stream(path, req_body, req_headers, wfile):
             wfile.flush()
             return
 
+        # 构建响应头
+        out_headers = [
+            ("Content-Type", "text/event-stream; charset=utf-8"),
+            ("Cache-Control", "no-cache"),
+            ("Connection", "keep-alive"),
+            ("Access-Control-Allow-Origin", "*"),
+        ]
+        # dump 出站响应头
+        dump_outgoing(200, "OK", out_headers, None)
+
         # 发送响应头 (SSE)
         wfile.write(b"HTTP/1.1 200 OK\r\n")
-        wfile.write(b"Content-Type: text/event-stream\r\n")
-        wfile.write(b"Cache-Control: no-cache\r\n")
-        wfile.write(b"Connection: keep-alive\r\n")
-        wfile.write(b"Access-Control-Allow-Origin: *\r\n")
+        for k, v in out_headers:
+            wfile.write(f"{k}: {v}\r\n".encode())
         wfile.write(b"\r\n")
         wfile.flush()
 
@@ -117,8 +181,38 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok", "ts": ts()}).encode())
             return
-        self.send_response(404)
-        self.end_headers()
+        # 代理 GET 请求到上游（/v1/models, /v1/models/xxx 等）
+        self._proxy_get(self.path)
+
+    def _proxy_get(self, path):
+        """转发 GET 请求到上游"""
+        conn = http.client.HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=30)
+        try:
+            headers = {
+                "Authorization": f"Bearer {API_KEY}",
+                "Host": f"{TARGET_HOST}:{TARGET_PORT}",
+            }
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            headers_out = [(k, v) for k, v in resp.getheaders() if k.lower() not in ("transfer-encoding", "content-encoding")]
+            dump_outgoing(resp.status, resp.reason, headers_out, resp_body)
+            self.send_response(resp.status)
+            for k, v in headers_out:
+                self.send_header(k, v)
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(resp_body)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            dump_outgoing(502, "Bad Gateway", [("Content-Type", "application/json")], err)
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(err)
+        finally:
+            conn.close()
 
     def do_POST(self):
         content_len = int(self.headers.get("Content-Length", 0))
@@ -126,15 +220,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # 解析请求体，判断是否流式
         is_stream = False
-        body_preview = req_body[:200].decode("utf-8", errors="replace")
         try:
             req_json = json.loads(req_body)
             is_stream = req_json.get("stream", False)
-            body_preview = json.dumps(req_json, ensure_ascii=False)[:200]
         except:
             pass
 
-        log("REQ ", f"POST {self.path} | stream={is_stream} | {body_preview}")
+        # 完整 dump 入站请求（原始字节/hex/文本）
+        headers_dict = {k: v for k, v in self.headers.items()}
+        dump_incoming("POST", self.path, headers_dict, req_body)
 
         # 构建上游请求头 (去掉Host和Connection, 添加Authorization)
         req_headers = {}
