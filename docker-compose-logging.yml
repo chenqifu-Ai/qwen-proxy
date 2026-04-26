@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: qwen-proxy-logs
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./nginx-logging.conf:/etc/nginx/nginx.conf
+      - ./logs:/var/log/nginx  # 挂载日志目录
+    restart: unless-stopped
+    environment:
+      - NGINX_PORT=8765
+    networks:
+      - proxy-network
+
+  # 日志收集器
+  log-collector:
+    image: alpine:latest
+    container_name: log-collector
+    volumes:
+      - ./logs:/var/log/nginx
+      - ./log-scripts:/app
+    command: sh -c "tail -f /var/log/nginx/access.log"
+    restart: unless-stopped
+    networks:
+      - proxy-network
+
+  # 日志分析界面（可选）
+  log-ui:
+    image: python:3.9-alpine
+    container_name: log-ui
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./logs:/app/logs
+      - ./log-analyzer.py:/app/analyzer.py
+    command: python /app/analyzer.py
+    restart: unless-stopped
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local
